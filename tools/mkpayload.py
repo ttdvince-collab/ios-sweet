@@ -140,7 +140,7 @@ def adt_dram(adt_blob):
             struct.unpack('<Q', chosen.prop('dram-size'))[0])
 
 
-def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
+def build(kernel_path, adt_path, cmdline, ramdisk_path=None, external=False):
     buf = bytearray(open(kernel_path, 'rb').read())
     m = parse_macho(buf)
     nfix = apply_chained_fixups(buf, m)
@@ -159,8 +159,9 @@ def build(kernel_path, adt_path, cmdline, ramdisk_path=None):
     pieces = [(s['vmaddr'], s['vmsize'], buf[s['fileoff']:s['fileoff'] + s['filesize']]) for s in segs]
     ramdisk = None
     if ramdisk_path:
-        image = open(ramdisk_path, 'rb').read()
-        rd_size = (len(image) + PAGE - 1) & ~(PAGE - 1)
+        # external: only reserve the range; qemu-sweet.py --ramdisk loads the file there
+        image = b'' if external else open(ramdisk_path, 'rb').read()
+        rd_size = (os.path.getsize(ramdisk_path) + PAGE - 1) & ~(PAGE - 1)
         rd_va = kernel_end
         kernel_end = rd_va + rd_size
         rd_pa = rd_va - virt_base + PHYS_BASE
@@ -198,8 +199,9 @@ if __name__ == '__main__':
     ap.add_argument('kernel'); ap.add_argument('adt'); ap.add_argument('out')
     ap.add_argument('--cmdline', default='debug=0xc serial=3 cpus=1 keepsyms=1')
     ap.add_argument('--ramdisk', help='root image for md0 (boot with rd=md0)')
+    ap.add_argument('--ramdisk-external', help='like --ramdisk, but only reserve its size (QEMU: qemu-sweet.py --ramdisk)')
     a = ap.parse_args()
-    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk)
+    blob, info = build(a.kernel, a.adt, a.cmdline, a.ramdisk or a.ramdisk_external, bool(a.ramdisk_external))
     open(a.out, 'wb').write(blob)
     for k, v in info.items():
         if k != 'segs':

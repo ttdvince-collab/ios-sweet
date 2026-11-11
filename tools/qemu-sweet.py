@@ -59,23 +59,79 @@ def check_qemu_dependency(cpu='cortex-a76'):
 
 
 def check_kernel_tools(kernel_path):
-    """Verify llvm-nm is available when --kernel is specified."""
-    if not shutil.which('llvm-nm'):
-        print('[!] Error: llvm-nm not found in PATH, required for --kernel font extraction.', file=sys.stderr)
-        print('    Install instructions:', file=sys.stderr)
-        print('      Arch Linux:    sudo pacman -S llvm', file=sys.stderr)
-        print('      Ubuntu/Debian: sudo apt install llvm', file=sys.stderr)
-        print('      Fedora:         sudo dnf install llvm', file=sys.stderr)
-        print('      macOS:          brew install llvm', file=sys.stderr)
-        return False
+    """--kernel needs only the Mach-O itself (symbols are read in Python, no llvm-nm)."""
     if not os.path.isfile(kernel_path):
         print(f'[!] Error: kernel file does not exist: {kernel_path}', file=sys.stderr)
         return False
     return True
 
 
+def macho_symbols(path, *names):
+    """Return {name: value} for defined symbols of a 64-bit Mach-O (LC_SYMTAB)."""
+    data = open(path, 'rb').read()
+    magic, _, _, _, ncmds, _, _, _ = struct.unpack_from('<8I', data, 0)
+    assert magic == 0xfeedfacf, 'not a 64-bit Mach-O'
+    off, want, found = 32, {n.encode() for n in names}, {}
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<2I', data, off)
+        if cmd == 0x2:	# LC_SYMTAB
+            symoff, nsyms, stroff, _ = struct.unpack_from('<4I', data, off + 8)
+            for i in range(nsyms):
+                strx, ntype, _, _, value = struct.unpack_from('<IBBHQ', data, symoff + 16 * i)
+                if ntype & 0x0e == 0:	# N_UNDF
+                    continue
+                end = data.index(b'\0', stroff + strx)
+                name = data[stroff + strx:end]
+                if name in want:
+                    found[name.decode()] = value
+        off += size
+    return found
+
+
+def qmp_memsave(mon, va, size, path):
+    """Save guest VIRTUAL memory (current CPU translation) to path over QMP."""
+    if isinstance(mon, tuple):
+        s = socket.create_connection(mon)
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(mon)
+    f = s.makefile('rw')
+    f.readline()
+    for execute, args in (('qmp_capabilities', {}),
+                          ('memsave', {'val': va, 'size': size, 'filename': path})):
+        f.write(json.dumps({'execute': execute, 'arguments': args}) + '\n')
+        f.flush()
+        while True:
+            r = json.loads(f.readline())
+            if 'return' in r or 'error' in r:
+                break
+        if 'error' in r:
+            s.close()
+            raise RuntimeError(f'memsave {va:#x}: {r["error"]}')
+    s.close()
+    data = open(path, 'rb').read()
+    os.unlink(path)
+    return data
+
+
+def dump_msgbuf(mon, msgbufp, out):
+    """Write the kernel message buffer (struct msgbuf, bsd/sys/msgbuf.h) to out/kernel-log.txt."""
+    ptr = struct.unpack('<Q', qmp_memsave(mon, msgbufp, 8, f'{out}/mb.tmp'))[0]
+    magic, size, bufx, _, bufc = struct.unpack('<4IQ', qmp_memsave(mon, ptr, 24, f'{out}/mb.tmp'))
+    if magic != 0x63061:
+        raise RuntimeError(f'msgbuf magic {magic:#x} (kernel log not set up yet?)')
+    raw = qmp_memsave(mon, bufc, size, f'{out}/mb.tmp')
+    text = (raw[bufx:] + raw[:bufx]).replace(b'\0', b'').decode('utf-8', 'replace')
+    open(f'{out}/kernel-log.txt', 'w', encoding='utf-8').write(text)
+    return text
+
+
 def build_image(payload):
-    """Return (phys_base, ram_image, boot_args_pa, entry_pa)."""
+    """Return (phys_base, [(pa, bytes)...], boot_args_pa, entry_pa, external_ramdisk_pa).
+
+    A segment with no file data of 64 MB or more (mkpayload.py --ramdisk-external)
+    is left out of the chunks: guest RAM starts zeroed and QEMU loads the file there.
+    """
     magic, ver, nsegs = struct.unpack_from('<8sII', payload, 0)
     assert magic == b'SWEETXNU' and ver == 1, 'not a SWEETXNU v1 payload'
     virt_base, entry_va, adt_off, adt_size, kernel_end, phys_base, mem_size = \
@@ -85,18 +141,32 @@ def build_image(payload):
     adt_pa = kernel_end + delta
     ba_pa = (adt_pa + adt_size + PAGE - 1) & ~(PAGE - 1)
     top = ba_pa + PAGE
-    img = bytearray(top - phys_base)
+    hole = None
     for i in range(nsegs):
         vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
-        o = vmaddr + delta - phys_base
-        img[o:o + fsize] = payload[foff:foff + fsize]
-    img[adt_pa - phys_base:adt_pa - phys_base + adt_size] = payload[adt_off:adt_off + adt_size]
+        if fsize == 0 and vmsize >= 64 << 20:
+            hole = (vmaddr + delta, vmsize)
+    low_top = hole[0] if hole else top
+    img = bytearray(low_top - phys_base)
+    hi_base = hole[0] + hole[1] if hole else top
+    hi = bytearray(top - hi_base)
+    def place(pa, data):
+        if pa < low_top:
+            img[pa - phys_base:pa - phys_base + len(data)] = data
+        else:
+            hi[pa - hi_base:pa - hi_base + len(data)] = data
+    for i in range(nsegs):
+        vmaddr, vmsize, foff, fsize = struct.unpack_from('<4Q', payload, 0x2a8 + 32 * i)
+        if fsize:
+            place(vmaddr + delta, payload[foff:foff + fsize])
+    place(adt_pa, payload[adt_off:adt_off + adt_size])
     ba = struct.pack('<HH4x4Q6QI4xQI', 2, 2, virt_base, phys_base, mem_size, top,
                      FB_BASE, 1, FB_STRIDE, FB_W, FB_H, 32, 0, adt_pa - delta, adt_size)
     ba += cmdline + b'\0' * 4 + struct.pack('<QQ', 0, mem_size)
     assert len(ba) == 736
-    img[ba_pa - phys_base:ba_pa - phys_base + len(ba)] = ba
-    return phys_base, bytes(img), ba_pa, entry_va + delta
+    place(ba_pa, ba)
+    chunks = [(phys_base, bytes(img))] + ([(hi_base, bytes(hi))] if hole else [])
+    return phys_base, chunks, ba_pa, entry_va + delta, hole[0] if hole else None
 
 
 def stub(ba_pa, entry_pa):
@@ -163,8 +233,11 @@ def screen_result(screen, unknown):
 
 def qmp(sock_path, *cmds, pmemsave=None):
     """Run QEMU human-monitor commands over QMP (synchronous, unlike the echoing HMP socket)."""
-    s = socket.socket(socket.AF_UNIX)
-    s.connect(sock_path)
+    if isinstance(sock_path, tuple):	# Windows: no AF_UNIX in Python, use TCP
+        s = socket.create_connection(sock_path)
+    else:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(sock_path)
     f = s.makefile('rw')
     f.readline()
 
@@ -220,13 +293,16 @@ def main():
     )
     ap.add_argument('payload', nargs='?', help='SWEETXNU payload binary (from mkpayload.py)')
     ap.add_argument('outdir', nargs='?', help='Output directory for fb.png, regs.txt, and logs')
-    ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds (default: 20)')
+    ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds (default: 20; 0 = until OUTDIR/STOP exists)')
+    ap.add_argument('--live-interval', type=float, default=0, help='save OUTDIR/live.png every N seconds while running')
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
-    ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
+    ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (also saves the full kernel log)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
+    ap.add_argument('--ramdisk', help='md0 root image for a payload built with mkpayload.py --ramdisk-external')
+    ap.add_argument('--smp', type=int, default=1, help='CPU cores (boot-arg cpus= must match)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
 
@@ -253,30 +329,42 @@ def main():
     payload = open(a.payload, 'rb').read()
     font = None
     if a.kernel:
-        symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
-        fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
-                 if line.split()[-1:] == ['_iso_font']]
-        if len(fonts) != 1:
-            ap.error('kernel must contain exactly one _iso_font symbol')
-        font = payload_data(payload, fonts[0], 256 * 16)
+        syms = macho_symbols(a.kernel, '_iso_font', '_msgbufp')
+        if '_iso_font' not in syms:
+            ap.error('kernel must contain an _iso_font symbol')
+        font = payload_data(payload, syms['_iso_font'], 256 * 16)
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.abspath(a.outdir)
 
-    phys_base, img, ba_pa, entry_pa = build_image(payload)
-    open(f'{out}/ram.bin', 'wb').write(img)
+    phys_base, chunks, ba_pa, entry_pa, rd_pa = build_image(payload)
+    if rd_pa is not None and not a.ramdisk:
+        ap.error('payload was built with --ramdisk-external: pass the same image with --ramdisk')
+    loaders = []
+    for n, (pa, data) in enumerate(chunks):
+        open(f'{out}/ram{n}.bin', 'wb').write(data)
+        loaders += ['-device', f'loader,file={out}/ram{n}.bin,addr={pa:#x},force-raw=on']
+    if rd_pa is not None:
+        loaders += ['-device', f'loader,file={os.path.abspath(a.ramdisk)},addr={rd_pa:#x},force-raw=on']
+        print(f'md0 root {a.ramdisk} at {rd_pa:#x}', file=sys.stderr)
     open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
-    mon = f'{out}/mon.sock'
-    if os.path.exists(mon):
-        os.unlink(mon)
+    if hasattr(socket, 'AF_UNIX') and os.name != 'nt':
+        mon = f'{out}/mon.sock'
+        if os.path.exists(mon):
+            os.unlink(mon)
+        qmp_arg = f'unix:{mon},server,nowait'
+    else:
+        mon = ('127.0.0.1', 4444)
+        qmp_arg = 'tcp:127.0.0.1:4444,server,nowait'
     # virt RAM starts at 0x40000000: cover the payload's RAM (mkadt.py --highmem needs 8G).
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
-    cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
+    machine = 'virt,gic-version=3'	# no EL2/EL3: QEMU emulates PSCI over HVC (sweethvc=1)
+    cmd = ['qemu-system-aarch64', '-M', machine, '-accel', 'tcg,thread=multi', '-cpu', a.cpu, '-smp', str(a.smp), '-m', f'{ram_gib}G',
+           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', qmp_arg,
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
-           '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',
+           *loaders,
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
@@ -293,10 +381,25 @@ def main():
             p.wait()
             return 0
 
-        t0 = time.time()
-        while p.poll() is None and time.time() - t0 < a.secs:
+        t0 = last_live = time.time()
+        stop_file = f'{out}/STOP'
+        if os.path.exists(stop_file):
+            os.unlink(stop_file)
+        while p.poll() is None and (a.secs <= 0 or time.time() - t0 < a.secs):
+            if os.path.exists(stop_file):
+                print('[*] stop requested', file=sys.stderr)
+                break
             if a.live_serial:
                 serial_pos = stream_serial_file(serial_file, serial_pos)
+            if a.live_interval and time.time() - last_live >= a.live_interval:
+                last_live = time.time()
+                try:	# pmemsave works while the guest keeps running
+                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/live.raw'))
+                    write_png(f'{out}/live.tmp.png', open(f'{out}/live.raw', 'rb').read())
+                    os.replace(f'{out}/live.tmp.png', f'{out}/live.png')
+                    print(f'[live] {time.time() - t0:.0f}s', file=sys.stderr, flush=True)
+                except (OSError, ValueError) as e:	# QMP not up yet, or a reader holds the file
+                    print(f'[live] skipped: {e}', file=sys.stderr, flush=True)
             time.sleep(0.2)
 
         if a.live_serial:
@@ -306,6 +409,12 @@ def main():
         if p.poll() is None:
             _, regs, *extra = qmp(mon, 'stop', 'info registers', *a.hmp, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/fb.raw'))
             open(f'{out}/regs.txt', 'w').write(regs + ''.join(f'\n(qemu) {c}\n{r}' for c, r in zip(a.hmp, extra)))
+            if a.kernel and '_msgbufp' in syms:
+                try:
+                    log = dump_msgbuf(mon, syms['_msgbufp'], out)
+                    print(f'[*] kernel log: {len(log.splitlines())} lines -> {out}/kernel-log.txt', file=sys.stderr)
+                except Exception as e:
+                    print(f'[!] kernel log not read: {e}', file=sys.stderr)
             p.kill()
             p.wait()
             raw = open(f'{out}/fb.raw', 'rb').read()
@@ -337,12 +446,13 @@ def main():
             p.wait()
         return 130
     finally:
-        ram_file = f'{out}/ram.bin'
-        if os.path.exists(ram_file):
-            try:
-                os.unlink(ram_file)
-            except Exception:
-                pass
+        for n in range(2):
+            ram_file = f'{out}/ram{n}.bin'
+            if os.path.exists(ram_file):
+                try:
+                    os.unlink(ram_file)
+                except Exception:
+                    pass
 
 
 if __name__ == '__main__':
