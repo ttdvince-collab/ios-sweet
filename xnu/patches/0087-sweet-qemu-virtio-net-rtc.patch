@@ -1,0 +1,581 @@
+From: ios-sweet Windows/QEMU port
+Subject: [PATCH] sweet: QEMU network (virtio-net, boot-arg sweetvnet=1) + clock from the PL031 (sweetrtc=1)
+
+QEMU has no network the phone port can use, and no IORTC: the calendar
+started at 1970, which also makes every TLS certificate "not yet valid".
+
+sweet_vnet.c drives a QEMU virt virtio-mmio network device (virtio 1.x,
+polled from a kernel thread every 2 ms, 64 x 2 KiB RX/TX buffers, no
+offloads) as the kernel ethernet interface en1, with the same ifnet glue
+as the phone's USB ECM ue0. It sets 10.0.2.15/24 and a default route to
+10.0.2.2 for QEMU's user-mode network (QEMU's DNS proxy is 10.0.2.3).
+Started from sweet_ufs_init in ufsvirtio mode.
+
+With sweetrtc=1, IOKitInitializeTime sets the calendar from the QEMU virt
+PL031 RTC (0x09010000, data register = host UTC seconds).
+
+Without the boot-args nothing changes.
+
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_vnet.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_vnet_start(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -883,6 +884,7 @@
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	if (su.virtio) {
++		sweet_vnet_start();             /* QEMU virtio-net (boot-arg sweetvnet=1) */
+ 		return 0;
+ 	}
+ 	sweet_log_start();
+--- /dev/null
++++ b/bsd/dev/sweet_vnet.c
+@@ -0,0 +1,486 @@
++/*
++ * SWEET on QEMU: network over a QEMU virt virtio-mmio network device
++ * (virtio 1.x MMIO, QEMU's -global virtio-mmio.force-legacy=false), enabled
++ * with boot-arg sweetvnet=1. Kernel ethernet interface en1, the same ifnet
++ * glue as the phone's USB ECM interface ue0 (sweet_usb.c). Polled from a
++ * kernel thread (no interrupts), one 2 KiB buffer per frame, no offloads.
++ *
++ * Addresses fit QEMU's user-mode network ("slirp", -netdev user): the
++ * kernel sets 10.0.2.15/24 and a default route to 10.0.2.2; QEMU's DNS
++ * proxy is 10.0.2.3. Boot-args sweetvnet_ip / _gw (32-bit, host order)
++ * override them. QEMU's TCG is cache coherent: no cache maintenance.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/kpi_socket.h>
++#include <sys/sockio.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/kpi_protocol.h>
++#include <net/route.h>
++#include <netinet/in.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++void sweet_vnet_start(void);
++
++#define VIO_BASE                0x0a000000ULL
++#define VIO_SLOT                0x200u
++#define VIO_SLOTS               32u
++#define VIO_MAGIC               0x000
++#define VIO_VERSION             0x004
++#define VIO_DEVICE_ID           0x008
++#define VIO_DEV_FEAT            0x010
++#define VIO_DEV_FEAT_SEL        0x014
++#define VIO_DRV_FEAT            0x020
++#define VIO_DRV_FEAT_SEL        0x024
++#define VIO_QUEUE_SEL           0x030
++#define VIO_QUEUE_NUM_MAX       0x034
++#define VIO_QUEUE_NUM           0x038
++#define VIO_QUEUE_READY         0x044
++#define VIO_QUEUE_NOTIFY        0x050
++#define VIO_INT_STATUS          0x060
++#define VIO_INT_ACK             0x064
++#define VIO_STATUS              0x070
++#define VIO_QUEUE_DESC          0x080
++#define VIO_QUEUE_AVAIL         0x090
++#define VIO_QUEUE_USED          0x0a0
++#define VIO_CONFIG              0x100
++#define VIO_ST_ACK              1u
++#define VIO_ST_DRIVER           2u
++#define VIO_ST_DRIVER_OK        4u
++#define VIO_ST_FEATURES_OK      8u
++#define VQ_F_WRITE              2u
++#define VNET_F_MAC              (1u << 5)
++
++#define VN_QSIZE                64u
++#define VN_BUF                  2048u
++#define VN_HDR                  12u             /* virtio_net_hdr_v1 (VERSION_1) */
++/* DMA layout: per queue desc / avail / used, then the frame buffers. */
++#define VN_RXQ                  0x0000
++#define VN_TXQ                  0x1000
++#define VQ_DESC                 0x000
++#define VQ_AVAIL                0x400
++#define VQ_USED                 0x800
++#define VN_RXBUF                0x2000
++#define VN_TXBUF                (VN_RXBUF + VN_QSIZE * VN_BUF)
++#define VN_SIZE                 0x44000         /* >= VN_TXBUF + VN_QSIZE * VN_BUF, page multiple */
++
++struct vq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags, next;
++};
++struct vq_avail {
++	uint16_t flags, idx, ring[VN_QSIZE];
++};
++struct vq_used {
++	uint16_t flags, idx;
++	struct {
++		uint32_t id, len;
++	} ring[VN_QSIZE];
++};
++
++static struct {
++	vm_offset_t regs;
++	vm_offset_t dma;
++	uint64_t    dma_pa;
++	uint8_t     mac[ETHER_ADDR_LEN];
++	ifnet_t     ifp;
++	lck_mtx_t  *lock;               /* TX queue */
++	uint16_t    rx_seen;            /* used-ring entries consumed */
++	uint16_t    tx_seen;
++	uint64_t    rx_frames, tx_frames, tx_drops;
++	int         sleep_chan;
++} vn;
++
++static inline uint32_t
++vn_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(vn.regs + off);
++}
++
++static inline void
++vn_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(vn.regs + off) = v;
++}
++
++static void
++vn_wr64(uint32_t off, uint64_t v)
++{
++	vn_wr(off, (uint32_t)v);
++	vn_wr(off + 4, (uint32_t)(v >> 32));
++}
++
++#define VQ(q, part, type)       ((type *)(vn.dma + (q) + (part)))
++
++static int
++vn_queue_init(uint32_t sel, uint32_t q)
++{
++	vn_wr(VIO_QUEUE_SEL, sel);
++	if (vn_rd(VIO_QUEUE_NUM_MAX) < VN_QSIZE) {
++		return ENXIO;
++	}
++	vn_wr(VIO_QUEUE_NUM, VN_QSIZE);
++	vn_wr64(VIO_QUEUE_DESC, vn.dma_pa + q + VQ_DESC);
++	vn_wr64(VIO_QUEUE_AVAIL, vn.dma_pa + q + VQ_AVAIL);
++	vn_wr64(VIO_QUEUE_USED, vn.dma_pa + q + VQ_USED);
++	vn_wr(VIO_QUEUE_READY, 1);
++	return 0;
++}
++
++static int
++vn_device_init(void)
++{
++	vm_offset_t base = ml_io_map(VIO_BASE, VIO_SLOT * VIO_SLOTS);
++
++	for (uint32_t i = 0; i < VIO_SLOTS; i++) {
++		vm_offset_t r = base + i * VIO_SLOT;
++		if (*(volatile uint32_t *)(r + VIO_MAGIC) == 0x74726976 &&     /* "virt" */
++		    *(volatile uint32_t *)(r + VIO_DEVICE_ID) == 1) {           /* network */
++			vn.regs = r;
++			break;
++		}
++	}
++	if (!vn.regs) {
++		printf("SWEET VNET: no virtio network device\n");
++		return ENXIO;
++	}
++	if (vn_rd(VIO_VERSION) != 2) {
++		printf("SWEET VNET: legacy virtio-mmio (needs -global virtio-mmio.force-legacy=false)\n");
++		return ENXIO;
++	}
++	vn_wr(VIO_STATUS, 0);
++	vn_wr(VIO_STATUS, VIO_ST_ACK);
++	vn_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER);
++	vn_wr(VIO_DEV_FEAT_SEL, 0);
++	uint32_t f0 = vn_rd(VIO_DEV_FEAT);
++	vn_wr(VIO_DEV_FEAT_SEL, 1);
++	if (!(vn_rd(VIO_DEV_FEAT) & 1)) {               /* VIRTIO_F_VERSION_1 */
++		printf("SWEET VNET: device is not virtio 1.x\n");
++		return ENXIO;
++	}
++	vn_wr(VIO_DRV_FEAT_SEL, 1);
++	vn_wr(VIO_DRV_FEAT, 1);
++	vn_wr(VIO_DRV_FEAT_SEL, 0);
++	vn_wr(VIO_DRV_FEAT, f0 & VNET_F_MAC);
++	vn_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER | VIO_ST_FEATURES_OK);
++	if (!(vn_rd(VIO_STATUS) & VIO_ST_FEATURES_OK)) {
++		printf("SWEET VNET: features not accepted\n");
++		return ENXIO;
++	}
++	if (kmem_alloc_contig(kernel_map, &vn.dma, VN_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET VNET: no contiguous DMA memory\n");
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)vn.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	vn.dma_pa = ptoa_64(pn);
++	if (vn_queue_init(0, VN_RXQ) || vn_queue_init(1, VN_TXQ)) {
++		printf("SWEET VNET: queue too small\n");
++		return ENXIO;
++	}
++	if (f0 & VNET_F_MAC) {
++		for (int i = 0; i < ETHER_ADDR_LEN; i++) {
++			vn.mac[i] = *(volatile uint8_t *)(vn.regs + VIO_CONFIG + i);
++		}
++	} else {
++		static const uint8_t def[ETHER_ADDR_LEN] = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
++		memcpy(vn.mac, def, sizeof(def));
++	}
++
++	/* Every RX buffer goes to the device up front; each is re-posted after use. */
++	struct vq_desc *d = VQ(VN_RXQ, VQ_DESC, struct vq_desc);
++	struct vq_avail *av = VQ(VN_RXQ, VQ_AVAIL, struct vq_avail);
++	for (uint16_t i = 0; i < VN_QSIZE; i++) {
++		d[i].addr = vn.dma_pa + VN_RXBUF + (uint64_t)i * VN_BUF;
++		d[i].len = VN_BUF;
++		d[i].flags = VQ_F_WRITE;
++		d[i].next = 0;
++		av->ring[i] = i;
++	}
++	__builtin_arm_dsb(0xf);
++	av->idx = VN_QSIZE;
++	__builtin_arm_dsb(0xf);
++	vn_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER | VIO_ST_FEATURES_OK | VIO_ST_DRIVER_OK);
++	vn_wr(VIO_QUEUE_NOTIFY, 0);
++	return 0;
++}
++
++static void
++vn_rx_frame(const uint8_t *frame, uint32_t len)
++{
++	mbuf_t m = NULL;
++	/* One mbuf with a 2 KiB cluster holds any frame (see sweet_usb.c 0076). */
++	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) == 0 &&
++	    (mbuf_flags(m) & MBUF_EXT) && mbuf_maxlen(m) >= len) {
++		struct ifnet_stat_increment_param stats = {};
++		memcpy(mbuf_data(m), frame, len);
++		mbuf_setlen(m, len);
++		mbuf_pkthdr_setlen(m, len);
++		void *frame_header = mbuf_data(m);
++		mbuf_pkthdr_setrcvif(m, vn.ifp);
++		mbuf_pkthdr_setheader(m, frame_header);
++		mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++		(void)mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++		stats.packets_in = 1;
++		stats.bytes_in = len;
++		vn.rx_frames++;
++		ifnet_input(vn.ifp, m, &stats);
++	} else if (m != NULL) {
++		mbuf_freem(m);
++	}
++}
++
++/* Hand every received frame to the stack and give its buffer back. */
++static void
++vn_rx_poll(void)
++{
++	volatile struct vq_used *us = VQ(VN_RXQ, VQ_USED, volatile struct vq_used);
++	struct vq_avail *av = VQ(VN_RXQ, VQ_AVAIL, struct vq_avail);
++	bool posted = false;
++
++	while (vn.rx_seen != us->idx) {
++		__builtin_arm_dsb(0xf);
++		uint32_t id = us->ring[vn.rx_seen % VN_QSIZE].id;
++		uint32_t len = us->ring[vn.rx_seen % VN_QSIZE].len;
++		vn.rx_seen++;
++		if (id >= VN_QSIZE) {
++			continue;
++		}
++		if (len >= VN_HDR + ETHER_HDR_LEN && len <= VN_BUF) {
++			vn_rx_frame((const uint8_t *)(vn.dma + VN_RXBUF + id * VN_BUF + VN_HDR), len - VN_HDR);
++		}
++		av->ring[av->idx % VN_QSIZE] = (uint16_t)id;
++		__builtin_arm_dsb(0xf);
++		av->idx = (uint16_t)(av->idx + 1);
++		posted = true;
++	}
++	if (posted) {
++		__builtin_arm_dsb(0xf);
++		vn_wr(VIO_QUEUE_NOTIFY, 0);
++	}
++}
++
++/* TX buffers are used in ring order; QEMU completes them in order. vn.lock held. */
++static void
++vn_tx_reclaim_locked(void)
++{
++	volatile struct vq_used *us = VQ(VN_TXQ, VQ_USED, volatile struct vq_used);
++	vn.tx_seen = us->idx;
++}
++
++static errno_t
++vn_if_output(ifnet_t ifp, mbuf_t m)
++{
++	struct vq_desc *d = VQ(VN_TXQ, VQ_DESC, struct vq_desc);
++	struct vq_avail *av = VQ(VN_TXQ, VQ_AVAIL, struct vq_avail);
++	size_t len = mbuf_pkthdr_len(m);
++
++	if (len > VN_BUF - VN_HDR) {
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	lck_mtx_lock(vn.lock);
++	vn_tx_reclaim_locked();
++	if ((uint32_t)(uint16_t)(av->idx - vn.tx_seen) >= VN_QSIZE) {
++		vn.tx_drops++;
++		lck_mtx_unlock(vn.lock);
++		mbuf_freem(m);
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++		return 0;
++	}
++	uint16_t slot = (uint16_t)(av->idx % VN_QSIZE);
++	uint8_t *buf = (uint8_t *)(vn.dma + VN_TXBUF + slot * VN_BUF);
++	bzero(buf, VN_HDR);
++	mbuf_copydata(m, 0, len, buf + VN_HDR);
++	d[slot].addr = vn.dma_pa + VN_TXBUF + (uint64_t)slot * VN_BUF;
++	d[slot].len = (uint32_t)(VN_HDR + len);
++	d[slot].flags = 0;
++	d[slot].next = 0;
++	av->ring[slot] = slot;
++	__builtin_arm_dsb(0xf);
++	av->idx = (uint16_t)(av->idx + 1);
++	__builtin_arm_dsb(0xf);
++	vn_wr(VIO_QUEUE_NOTIFY, 1);
++	vn.tx_frames++;
++	lck_mtx_unlock(vn.lock);
++	ifnet_stat_increment_out(ifp, 1, len, 0);
++	mbuf_freem(m);
++	return 0;
++}
++
++static errno_t
++vn_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data __unused)
++{
++	switch (cmd) {
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static void
++vn_if_detach(ifnet_t ifp __unused)
++{
++}
++
++static void
++vn_sin(struct sockaddr_in *a, uint32_t addr)
++{
++	bzero(a, sizeof(*a));
++	a->sin_len = sizeof(*a);
++	a->sin_family = AF_INET;
++	a->sin_addr.s_addr = htonl(addr);
++}
++
++static int
++vn_if_create(uint32_t ip, uint32_t gw)
++{
++	struct ifnet_init_eparams init;
++
++	vn.lock = lck_mtx_alloc_init(lck_grp_alloc_init("sweet_vnet", LCK_GRP_ATTR_NULL), LCK_ATTR_NULL);
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-virtio-net";
++	init.uniqueid_len = sizeof("sweet-virtio-net") - 1;
++	init.name = "en";
++	init.unit = 1;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.type = IFT_ETHER;
++	init.output = vn_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = vn_if_ioctl;
++	init.detach = vn_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &vn.ifp) != 0) {
++		vn.ifp = NULL;
++		return ENOMEM;
++	}
++	ifnet_set_addrlen(vn.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(vn.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(vn.ifp, ETHERMTU);
++	ifnet_set_baudrate(vn.ifp, 1000000000);
++	ifnet_set_flags(vn.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(vn.ifp, NULL) != 0) {
++		vn.ifp = NULL;
++		return ENXIO;
++	}
++	ifnet_set_lladdr(vn.ifp, vn.mac, ETHER_ADDR_LEN);
++	ifnet_set_flags(vn.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++
++	errno_t err = proto_plumb(PF_INET, vn.ifp);
++	socket_t so = NULL;
++	if (err == 0) {
++		err = sock_socket(PF_INET, SOCK_DGRAM, 0, NULL, NULL, &so);
++	}
++	if (err == 0) {
++		struct ifaliasreq ifra;
++		bzero(&ifra, sizeof(ifra));
++		snprintf(ifra.ifra_name, sizeof(ifra.ifra_name), "en1");
++		vn_sin((struct sockaddr_in *)&ifra.ifra_addr, ip);
++		vn_sin((struct sockaddr_in *)&ifra.ifra_mask, 0xffffff00);
++		vn_sin((struct sockaddr_in *)&ifra.ifra_broadaddr, ip | 0xff);
++		err = sock_ioctl(so, SIOCAIFADDR, &ifra);
++		sock_close(so);
++	}
++	int rerr = -1;
++	if (err == 0) {
++		struct sockaddr_in dst, mask, gate;
++		vn_sin(&dst, 0);
++		vn_sin(&mask, 0);
++		vn_sin(&gate, gw);
++		rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gate,
++		    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++	}
++	printf("SWEET VNET: en1 %02x:%02x:%02x:%02x:%02x:%02x %u.%u.%u.%u/24 gw %u.%u.%u.%u (addr err %d, route err %d)\n",
++	    vn.mac[0], vn.mac[1], vn.mac[2], vn.mac[3], vn.mac[4], vn.mac[5],
++	    ip >> 24, (ip >> 16) & 0xff, (ip >> 8) & 0xff, ip & 0xff,
++	    gw >> 24, (gw >> 16) & 0xff, (gw >> 8) & 0xff, gw & 0xff, err, rerr);
++	return err;
++}
++
++static void
++vn_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&vn.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++vn_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	uint64_t next_report = 0, period;
++	nanoseconds_to_absolutetime(60ULL * NSEC_PER_SEC, &period);
++	for (;;) {
++		vn_rx_poll();
++		vn_wr(VIO_INT_ACK, vn_rd(VIO_INT_STATUS));
++		if (mach_absolute_time() > next_report) {
++			if (next_report) {
++				printf("SWEET VNET: rx %llu tx %llu frames, %llu tx drops\n",
++				    vn.rx_frames, vn.tx_frames, vn.tx_drops);
++			}
++			next_report = mach_absolute_time() + period;
++		}
++		vn_sleep_ms(2);
++	}
++}
++
++void
++sweet_vnet_start(void)
++{
++	uint32_t on = 0, ip = 0x0a00020f, gw = 0x0a000202;     /* 10.0.2.15, 10.0.2.2 */
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetvnet", &on, sizeof(on)) || !on || vn.regs) {
++		return;
++	}
++	PE_parse_boot_argn("sweetvnet_ip", &ip, sizeof(ip));
++	PE_parse_boot_argn("sweetvnet_gw", &gw, sizeof(gw));
++	if (vn_device_init() != 0 || vn_if_create(ip, gw) != 0) {
++		return;
++	}
++	if (kernel_thread_start(vn_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -69,6 +69,33 @@
+ #include <kern/clock.h>
+ #include <sys/time.h>
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern void clock_set_calendar_microtime(clock_sec_t secs, clock_usec_t microsecs);
++
++/*
++ * SWEET on QEMU (boot-arg sweetrtc=1): no IORTC, so the calendar started at
++ * 0 (1970) and TLS rejected every certificate. Set it from the QEMU virt
++ * PL031 RTC (data register = host UTC seconds).
++ */
++static void
++sweet_qemu_rtc(void)
++{
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetrtc", &on, sizeof(on)) || !on) {
++		return;
++	}
++	volatile uint32_t *rtc = (volatile uint32_t *)ml_io_map(0x09010000, 0x1000);
++	uint32_t secs = rtc ? rtc[0] : 0;
++	if (secs > 1500000000) {
++		clock_set_calendar_microtime(secs, 0);
++	}
++	IOLog("SWEET RTC: PL031 %u
++", secs);
++}
++#endif
++
+ void
+ IOKitInitializeTime( void )
+ {
+@@ -89,6 +116,9 @@
+ #endif
+ 
+ 	clock_initialize_calendar();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_qemu_rtc();
++#endif
+ }
+ 
+ void

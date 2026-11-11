@@ -307,6 +307,7 @@ def main():
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--ramdisk', help='md0 root image for a payload built with mkpayload.py --ramdisk-external')
     ap.add_argument('--disk', help='root image as a virtio-blk disk (patch 0085: rd=ufsroot0 ufsvirtio=1)')
+    ap.add_argument('--net', action='store_true', help="QEMU user-mode network as a virtio-net device (patch 0087: sweetvnet=1)")
     ap.add_argument('--smp', type=int, default=1, help='CPU cores (boot-arg cpus= must match)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -390,6 +391,8 @@ def main():
            *(['-drive', f'file={os.path.abspath(a.disk)},if=none,format=raw,id=root,cache=writeback',
               '-device', 'virtio-blk-device,drive=root',
               '-global', 'virtio-mmio.force-legacy=false'] if a.disk else []),
+           *(['-netdev', 'user,id=net0', '-device', 'virtio-net-device,netdev=net0',
+              '-global', 'virtio-mmio.force-legacy=false'] if a.net else []),
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
