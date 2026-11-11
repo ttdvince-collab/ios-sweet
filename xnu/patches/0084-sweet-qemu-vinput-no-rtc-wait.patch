@@ -1,0 +1,256 @@
+From: ios-sweet Windows/QEMU port
+Subject: [PATCH] sweet: QEMU virtual input (touch, buttons, keyboard) + no RTC wait
+
+QEMU has none of the phone's touch (Goodix over GENI) or key (PMIC) hardware.
+With boot-arg sweetvinput=1 a kernel thread polls the QEMU virt PL011 UART
+(0x09000000) for one-line text commands from the host launcher and feeds
+SweetHIDTouch, SweetHIDButtons and a new SweetHIDKeyboard (HID page 7):
+  T <finger> <down> <x> <y> | B <key> <down> | K <usage> <down>
+Without the boot-arg nothing changes (the keyboard service does not start).
+
+IOKitInitializeTime waited 30 s for an IORTC that neither the phone port nor
+QEMU publishes: skip it on SWEET like Apple does on BCM2837.
+
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -78,7 +78,8 @@ IOKitInitializeTime( void )
+ 	t.tv_nsec = 0;
+ 
+ // RTC is not present on this target
+-#ifndef BCM2837
++// (SWEET: neither the phone port nor QEMU publishes an IORTC: skip the 30 s wait)
++#if !defined(BCM2837) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+ #endif
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -11,14 +11,21 @@
+  *
+  *   SweetHIDButtons  consumer-control keys (power, volume, home)
+  *   SweetHIDTouch    the built-in touch screen (digitizer collections)
++ *   SweetHIDKeyboard a hardware keyboard (QEMU only, boot-arg sweetvinput=1)
+  *
+  * Hardware drivers feed them through the C entry points sweet_hid_key()
+  * and sweet_hid_touch(). Boot-arg sweethidtest=N (seconds) presses Home
+  * every N seconds, to test the event path without input hardware.
++ *
++ * On QEMU (boot-arg sweetvinput=1) the phone's touch and key hardware is
++ * absent: sweet_vinput_start() polls the QEMU virt PL011 UART for text
++ * commands from the host launcher and feeds the same services.
+  */
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <kern/thread.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -375,8 +382,22 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 usage, bool down);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDKeyboard *gSweetKeyboard;
++static void sweet_vinput_start(void);
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -445,6 +466,7 @@ SweetHIDTouch::start(IOService *provider)
+ 	gSweetTouch = this;
+ 	registerService();
+ 	IOLog("SWEET HID: touch registered\n");
++	sweet_vinput_start();
+ 	return true;
+ }
+ 
+@@ -559,3 +581,161 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetvinput", &on, sizeof(on)) || !on) {
++		return false;   /* phone: no keyboard */
++	}
++	if (!IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetKeyboard = this;
++	registerService();
++	IOLog("SWEET HID: keyboard registered (QEMU virtual input)\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_KeyboardOrKeypad, usage, down);
++
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
++
++/*
++ * QEMU virtual input (boot-arg sweetvinput=1). The Windows launcher writes
++ * one text command per line into QEMU's serial chardev, which QEMU virt
++ * delivers to its PL011 UART at 0x09000000. This thread polls the RX FIFO:
++ *
++ *   T <finger> <down 0/1> <x> <y>   touch, panel pixels 0-1079 x 0-2399
++ *   B <key> <down>                  0 power, 1 volume up, 2 volume down, 3 home
++ *   K <usage> <down>                keyboard, HID usage page 7 (keyboard/keypad)
++ */
++#define SWEET_PL011_BASE        0x09000000ULL
++#define SWEET_PL011_DR          (0x000 / 4)
++#define SWEET_PL011_FR          (0x018 / 4)
++#define SWEET_PL011_FR_RXFE     0x10
++#define SWEET_PL011_LCR_H       (0x02c / 4)
++#define SWEET_PL011_CR          (0x030 / 4)
++#define SWEET_PL011_IMSC        (0x038 / 4)
++
++static IOMemoryMap *sweet_vin_map;
++static volatile uint32_t *sweet_vin_uart;
++
++/* Up to n space-separated decimal integers; returns how many, -1 on junk. */
++static int
++sweet_vin_parse(const char *s, int *v, int n)
++{
++	int count = 0;
++
++	while (*s && count < n) {
++		while (*s == ' ') {
++			s++;
++		}
++		if (!*s) {
++			break;
++		}
++		int neg = 0, val = 0, digits = 0;
++		if (*s == '-') {
++			neg = 1;
++			s++;
++		}
++		while (*s >= '0' && *s <= '9' && digits < 9) {
++			val = val * 10 + (*s - '0');
++			s++;
++			digits++;
++		}
++		if (!digits || (*s && *s != ' ')) {
++			return -1;
++		}
++		v[count++] = neg ? -val : val;
++	}
++	return count;
++}
++
++static void
++sweet_vin_command(const char *line)
++{
++	int v[4];
++	int n = sweet_vin_parse(line + 1, v, 4);
++
++	switch (line[0]) {
++	case 'T':
++		if (n == 4) {
++			sweet_hid_touch(v[0], v[1], v[2], v[3]);
++		}
++		break;
++	case 'B':
++		if (n == 2) {
++			sweet_hid_key(v[0], v[1]);
++		}
++		break;
++	case 'K':
++		if (n == 2 && gSweetKeyboard && v[0] > 0 && v[0] < 0x100) {
++			gSweetKeyboard->key((UInt32)v[0], v[1] != 0);
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++static void
++sweet_vin_thread(void *arg __unused, wait_result_t result __unused)
++{
++	char line[64];
++	unsigned len = 0;
++
++	IOLog("SWEET VINPUT: polling PL011 at 0x%llx\n", SWEET_PL011_BASE);
++	for (;;) {
++		while ((sweet_vin_uart[SWEET_PL011_FR] & SWEET_PL011_FR_RXFE) == 0) {
++			char ch = (char)(sweet_vin_uart[SWEET_PL011_DR] & 0xff);
++			if (ch == '\n' || ch == '\r') {
++				line[len] = 0;
++				if (len) {
++					sweet_vin_command(line);
++				}
++				len = 0;
++			} else if (len < sizeof(line) - 1) {
++				line[len++] = ch;
++			}
++		}
++		IOSleep(4);
++	}
++}
++
++static void
++sweet_vinput_start(void)
++{
++	uint32_t on = 0;
++	thread_t thread;
++
++	if (!PE_parse_boot_argn("sweetvinput", &on, sizeof(on)) || !on || sweet_vin_uart) {
++		return;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(SWEET_PL011_BASE, 0x1000, kIODirectionInOut);
++	if (!md) {
++		return;
++	}
++	sweet_vin_map = md->map(kIOMapInhibitCache);
++	md->release();
++	if (!sweet_vin_map) {
++		IOLog("SWEET VINPUT: cannot map the PL011\n");
++		return;
++	}
++	sweet_vin_uart = (volatile uint32_t *)sweet_vin_map->getVirtualAddress();
++	sweet_vin_uart[SWEET_PL011_IMSC] = 0;           /* no interrupts: polled */
++	sweet_vin_uart[SWEET_PL011_LCR_H] = 0x70;       /* 8 bits, FIFOs on */
++	sweet_vin_uart[SWEET_PL011_CR] = 0x301;         /* UARTEN | TXE | RXE */
++	if (kernel_thread_start(&sweet_vin_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -78,6 +78,11 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
+     "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
