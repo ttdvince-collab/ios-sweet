@@ -295,6 +295,10 @@ def main():
     ap.add_argument('outdir', nargs='?', help='Output directory for fb.png, regs.txt, and logs')
     ap.add_argument('--secs', type=float, default=20, help='Duration to run QEMU in seconds (default: 20; 0 = until OUTDIR/STOP exists)')
     ap.add_argument('--live-interval', type=float, default=0, help='save OUTDIR/live.png every N seconds while running')
+    ap.add_argument('--live-raw', action='store_true', help='live frames as raw BGRA OUTDIR/live.raw instead of PNG')
+    ap.add_argument('--vinput', type=int, default=0, help='serial (PL011) as TCP server on this port for virtual input (patch 0084)')
+    ap.add_argument('--vnc', type=int, help='ramfb display + VNC server on 127.0.0.1:5900+N (fast live screen)')
+    ap.add_argument('--trace', action='store_true', help='log every guest interrupt/exception to OUTDIR/qemu.log (slow)')
     ap.add_argument('--gdb', action='store_true', help='start halted, gdb stub on :1234, no timeout')
     ap.add_argument('--hmp', action='append', default=[], help='extra monitor command run after stop (repeatable), e.g. "x /8gx 0xfffffe..."')
     ap.add_argument('--cpu', default='cortex-a76', help='QEMU CPU model (default: cortex-a76)')
@@ -302,6 +306,7 @@ def main():
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
     ap.add_argument('--live-serial', action='store_true', help='stream serial console output to stdout in real time')
     ap.add_argument('--ramdisk', help='md0 root image for a payload built with mkpayload.py --ramdisk-external')
+    ap.add_argument('--disk', help='root image as a virtio-blk disk (patch 0085: rd=ufsroot0 ufsvirtio=1)')
     ap.add_argument('--smp', type=int, default=1, help='CPU cores (boot-arg cpus= must match)')
     ap.add_argument('--check-env', action='store_true', help='check QEMU installation and dependencies without running a payload')
     a = ap.parse_args()
@@ -346,7 +351,20 @@ def main():
     if rd_pa is not None:
         loaders += ['-device', f'loader,file={os.path.abspath(a.ramdisk)},addr={rd_pa:#x},force-raw=on']
         print(f'md0 root {a.ramdisk} at {rd_pa:#x}', file=sys.stderr)
-    open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
+    if a.vnc is not None:	# ramfb boot stub (tools/qemu-ramfb-stub.S)
+        rs = bytearray(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'qemu-ramfb-stub.bin'), 'rb').read())
+        d = 0x400
+        struct.pack_into('<QQ', rs, d, ba_pa, entry_pa)
+        # FWCfgDmaAccess: control (selector filled in by the stub), length, address of RAMFBCfg
+        struct.pack_into('>IIQ', rs, d + 0x10, 0, 28, STUB_PA + d + 0x20)
+        # RAMFBCfg: addr, fourcc XR24 (XRGB8888 = the panel's BGRA bytes), flags, width, height, stride
+        # Shown to QEMU as 2160x1200 with two panel rows per line: QEMU's VNC server caps
+        # the height at 2160, the panel is 2400 tall. Same bytes; the viewer reads them
+        # back as 1080x2400 (launcher VncClient, tools-bin/vncgrab.py).
+        struct.pack_into('>QIIIII', rs, d + 0x20, FB_BASE, 0x34325258, 0, FB_W * 2, FB_H // 2, FB_STRIDE * 2)
+        open(f'{out}/stub.bin', 'wb').write(rs)
+    else:
+        open(f'{out}/stub.bin', 'wb').write(stub(ba_pa, entry_pa))
     print(f'phys_base={phys_base:#x} boot_args={ba_pa:#x} entry={entry_pa:#x}', file=sys.stderr)
 
     if hasattr(socket, 'AF_UNIX') and os.name != 'nt':
@@ -361,10 +379,17 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     machine = 'virt,gic-version=3'	# no EL2/EL3: QEMU emulates PSCI over HVC (sweethvc=1)
-    cmd = ['qemu-system-aarch64', '-M', machine, '-accel', 'tcg,thread=multi', '-cpu', a.cpu, '-smp', str(a.smp), '-m', f'{ram_gib}G',
-           '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', qmp_arg,
-           '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
+    serial = f'tcp:127.0.0.1:{a.vinput},server,nowait' if a.vinput else f'file:{out}/serial.txt'
+    trace = ['-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log'] if a.trace else []
+    cmd = ['qemu-system-aarch64', '-M', machine, '-accel', 'tcg,thread=multi,tb-size=1024', '-cpu', a.cpu,
+           '-smp', str(a.smp), '-m', f'{ram_gib}G',
+           *(['-display', 'none', '-monitor', 'none', '-device', 'ramfb', '-vnc', f'127.0.0.1:{a.vnc}']
+             if a.vnc is not None else ['-nographic']),
+           '-serial', serial, '-qmp', qmp_arg, *trace, '-no-reboot',
            *loaders,
+           *(['-drive', f'file={os.path.abspath(a.disk)},if=none,format=raw,id=root,cache=writeback',
+              '-device', 'virtio-blk-device,drive=root',
+              '-global', 'virtio-mmio.force-legacy=false'] if a.disk else []),
            '-device', f'loader,file={out}/stub.bin,addr={STUB_PA:#x},force-raw=on',
            '-device', f'loader,addr={STUB_PA:#x},cpu-num=0']
     if a.gdb:
@@ -394,13 +419,16 @@ def main():
             if a.live_interval and time.time() - last_live >= a.live_interval:
                 last_live = time.time()
                 try:	# pmemsave works while the guest keeps running
-                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/live.raw'))
-                    write_png(f'{out}/live.tmp.png', open(f'{out}/live.raw', 'rb').read())
-                    os.replace(f'{out}/live.tmp.png', f'{out}/live.png')
+                    qmp(mon, pmemsave=(FB_BASE, FB_STRIDE * FB_H, f'{out}/live.tmp.raw'))
+                    if a.live_raw:	# the launcher reads raw BGRA: no PNG encoding
+                        os.replace(f'{out}/live.tmp.raw', f'{out}/live.raw')
+                    else:
+                        write_png(f'{out}/live.tmp.png', open(f'{out}/live.tmp.raw', 'rb').read())
+                        os.replace(f'{out}/live.tmp.png', f'{out}/live.png')
                     print(f'[live] {time.time() - t0:.0f}s', file=sys.stderr, flush=True)
                 except (OSError, ValueError) as e:	# QMP not up yet, or a reader holds the file
                     print(f'[live] skipped: {e}', file=sys.stderr, flush=True)
-            time.sleep(0.2)
+            time.sleep(0.03 if a.live_raw else 0.2)
 
         if a.live_serial:
             stream_serial_file(serial_file, serial_pos)
