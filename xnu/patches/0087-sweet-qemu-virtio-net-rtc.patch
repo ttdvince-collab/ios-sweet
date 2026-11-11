@@ -535,7 +535,7 @@ Without the boot-args nothing changes.
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- a/iokit/Kernel/IOStartIOKit.cpp
 +++ b/iokit/Kernel/IOStartIOKit.cpp
-@@ -69,6 +69,33 @@
+@@ -69,6 +69,32 @@
  #include <kern/clock.h>
  #include <sys/time.h>
  
@@ -561,8 +561,7 @@ Without the boot-args nothing changes.
 +	if (secs > 1500000000) {
 +		clock_set_calendar_microtime(secs, 0);
 +	}
-+	IOLog("SWEET RTC: PL031 %u
-+", secs);
++	IOLog("SWEET RTC: PL031 %u\n", secs);
 +}
 +#endif
 +
