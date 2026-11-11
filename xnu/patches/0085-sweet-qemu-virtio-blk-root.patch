@@ -1,0 +1,313 @@
+From: ios-sweet Windows/QEMU port
+Subject: [PATCH] sweet: root on a QEMU virtio-blk disk (boot-arg ufsvirtio=1)
+
+The md0 RAM-disk root made QEMU read the whole 14 GB image into host memory
+and keep a second copy for resets (34 GB for a 32 GB PC). With boot-arg
+ufsvirtio=1, sweet_ufs.c talks to a QEMU virt virtio-mmio block device
+(virtio 1.x, polled, one request at a time through the existing bounce
+buffer) instead of the UFS host. The whole disk is the root; the BSD disk
+ufsroot0 and rd=ufsroot0 are unchanged, and so is the phone without the
+boot-arg. The phone-only console log (writes the last 4 MiB of the disk)
+and the input/USB probes are skipped in this mode.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -109,6 +109,8 @@ static struct {
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool virtio;                            /* boot-arg ufsvirtio=1: QEMU virtio-blk */
++	vm_offset_t vregs;                      /* its virtio-mmio registers */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -256,10 +258,215 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	return 0;
+ }
+ 
++/*
++ * QEMU: boot-arg ufsvirtio=1 replaces the UFS host with a QEMU virt
++ * virtio-mmio block device (virtio 1.x MMIO, i.e. QEMU's
++ * -global virtio-mmio.force-legacy=false). The whole disk is the root (no
++ * GPT). Only the three block functions below change; the BSD disk
++ * ufsroot0 and rd=ufsroot0 above them are the phone's tested path.
++ * QEMU's TCG is cache coherent, so no cache maintenance is needed here.
++ */
++#define VIO_BASE                0x0a000000ULL
++#define VIO_SLOT                0x200u
++#define VIO_SLOTS               32u
++#define VIO_MAGIC               0x000
++#define VIO_VERSION             0x004
++#define VIO_DEVICE_ID           0x008
++#define VIO_DEV_FEAT            0x010
++#define VIO_DEV_FEAT_SEL        0x014
++#define VIO_DRV_FEAT            0x020
++#define VIO_DRV_FEAT_SEL        0x024
++#define VIO_QUEUE_SEL           0x030
++#define VIO_QUEUE_NUM_MAX       0x034
++#define VIO_QUEUE_NUM           0x038
++#define VIO_QUEUE_READY         0x044
++#define VIO_QUEUE_NOTIFY        0x050
++#define VIO_INT_STATUS          0x060
++#define VIO_INT_ACK             0x064
++#define VIO_STATUS              0x070
++#define VIO_QUEUE_DESC          0x080
++#define VIO_QUEUE_AVAIL         0x090
++#define VIO_QUEUE_USED          0x0a0
++#define VIO_CONFIG              0x100
++#define VIO_QSIZE               4u
++#define VIO_ST_ACK              1u
++#define VIO_ST_DRIVER           2u
++#define VIO_ST_DRIVER_OK        4u
++#define VIO_ST_FEATURES_OK      8u
++#define VQ_F_NEXT               1u
++#define VQ_F_WRITE              2u      /* device writes this buffer */
++#define VBLK_T_IN               0u
++#define VBLK_T_OUT              1u
++/* In the UFS descriptor area of the DMA allocation, unused in this mode. */
++#define VQ_DESC                 0x000
++#define VQ_AVAIL                0x100
++#define VQ_USED                 0x200
++#define VQ_REQ                  0x400
++#define VQ_STATUS               0x480
++
++struct vq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags, next;
++};
++struct vq_avail {
++	uint16_t flags, idx, ring[VIO_QSIZE];
++};
++struct vq_used {
++	uint16_t flags, idx;
++	struct {
++		uint32_t id, len;
++	} ring[VIO_QSIZE];
++};
++struct vblk_req {
++	uint32_t type, reserved;
++	uint64_t sector;
++};
++
++static inline uint32_t
++vio_rd(uint32_t off)
++{
++	return *(volatile uint32_t *)(su.vregs + off);
++}
++
++static inline void
++vio_wr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(su.vregs + off) = v;
++}
++
++static void
++vio_wr64(uint32_t off, uint64_t v)
++{
++	vio_wr(off, (uint32_t)v);
++	vio_wr(off + 4, (uint32_t)(v >> 32));
++}
++
++static int
++vblk_init(void)
++{
++	vm_offset_t base = ml_io_map(VIO_BASE, VIO_SLOT * VIO_SLOTS);
++
++	for (uint32_t i = 0; i < VIO_SLOTS; i++) {
++		vm_offset_t r = base + i * VIO_SLOT;
++		if (*(volatile uint32_t *)(r + VIO_MAGIC) == 0x74726976 &&     /* "virt" */
++		    *(volatile uint32_t *)(r + VIO_DEVICE_ID) == 2) {           /* block */
++			su.vregs = r;
++			break;
++		}
++	}
++	if (!su.vregs) {
++		printf("SWEET VBLK: no virtio block device\n");
++		return ENXIO;
++	}
++	if (vio_rd(VIO_VERSION) != 2) {
++		printf("SWEET VBLK: legacy virtio-mmio: run QEMU with -global virtio-mmio.force-legacy=false\n");
++		return ENXIO;
++	}
++	vio_wr(VIO_STATUS, 0);
++	vio_wr(VIO_STATUS, VIO_ST_ACK);
++	vio_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER);
++	vio_wr(VIO_DEV_FEAT_SEL, 1);
++	if (!(vio_rd(VIO_DEV_FEAT) & 1)) {              /* VIRTIO_F_VERSION_1 */
++		printf("SWEET VBLK: device is not virtio 1.x\n");
++		return ENXIO;
++	}
++	/* Only VERSION_1: no FLUSH feature, so QEMU writes through (nothing to sync). */
++	vio_wr(VIO_DRV_FEAT_SEL, 1);
++	vio_wr(VIO_DRV_FEAT, 1);
++	vio_wr(VIO_DRV_FEAT_SEL, 0);
++	vio_wr(VIO_DRV_FEAT, 0);
++	vio_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER | VIO_ST_FEATURES_OK);
++	if (!(vio_rd(VIO_STATUS) & VIO_ST_FEATURES_OK)) {
++		printf("SWEET VBLK: features not accepted\n");
++		return ENXIO;
++	}
++	vio_wr(VIO_QUEUE_SEL, 0);
++	if (vio_rd(VIO_QUEUE_NUM_MAX) < VIO_QSIZE) {
++		printf("SWEET VBLK: queue too small\n");
++		return ENXIO;
++	}
++	vio_wr(VIO_QUEUE_NUM, VIO_QSIZE);
++	bzero((void *)su.dma, DMA_UCD);
++	vio_wr64(VIO_QUEUE_DESC, su.dma_pa + VQ_DESC);
++	vio_wr64(VIO_QUEUE_AVAIL, su.dma_pa + VQ_AVAIL);
++	vio_wr64(VIO_QUEUE_USED, su.dma_pa + VQ_USED);
++	vio_wr(VIO_QUEUE_READY, 1);
++	vio_wr(VIO_STATUS, VIO_ST_ACK | VIO_ST_DRIVER | VIO_ST_FEATURES_OK | VIO_ST_DRIVER_OK);
++
++	uint64_t sectors = (uint64_t)vio_rd(VIO_CONFIG) | (uint64_t)vio_rd(VIO_CONFIG + 4) << 32;
++	su.first_block = 0;
++	su.nblocks = sectors / (UFS_BLOCK / 512);
++	printf("SWEET VBLK: virtio block device, %llu MiB\n", su.nblocks * UFS_BLOCK >> 20);
++	return su.nblocks ? 0 : ENXIO;
++}
++
++/* One polled request; data (count device blocks) in the bounce buffer. */
++static int
++vblk_io(uint32_t type, uint64_t lba, uint32_t count)
++{
++	struct vq_desc *d = (struct vq_desc *)(su.dma + VQ_DESC);
++	struct vq_avail *av = (struct vq_avail *)(su.dma + VQ_AVAIL);
++	volatile struct vq_used *us = (volatile struct vq_used *)(su.dma + VQ_USED);
++	struct vblk_req *req = (struct vblk_req *)(su.dma + VQ_REQ);
++	volatile uint8_t *status = (volatile uint8_t *)(su.dma + VQ_STATUS);
++	uint32_t len = count * UFS_BLOCK;
++
++	if (count == 0 || len > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++	req->type = type;
++	req->reserved = 0;
++	req->sector = lba * (UFS_BLOCK / 512);
++	*status = 0xff;
++	d[0].addr = su.dma_pa + VQ_REQ;
++	d[0].len = sizeof(*req);
++	d[0].flags = VQ_F_NEXT;
++	d[0].next = 1;
++	d[1].addr = su.dma_pa + DMA_BOUNCE;
++	d[1].len = len;
++	d[1].flags = (uint16_t)(VQ_F_NEXT | (type == VBLK_T_IN ? VQ_F_WRITE : 0));
++	d[1].next = 2;
++	d[2].addr = su.dma_pa + VQ_STATUS;
++	d[2].len = 1;
++	d[2].flags = VQ_F_WRITE;
++	d[2].next = 0;
++
++	uint16_t seen = us->idx;
++	av->ring[av->idx % VIO_QSIZE] = 0;
++	__builtin_arm_dsb(0xf);
++	av->idx = (uint16_t)(av->idx + 1);
++	__builtin_arm_dsb(0xf);
++	vio_wr(VIO_QUEUE_NOTIFY, 0);
++
++	uint64_t deadline;
++	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
++	deadline += mach_absolute_time();
++	while (us->idx == seen) {
++		if (mach_absolute_time() > deadline) {
++			printf("SWEET VBLK: %s of %u blocks at 0x%llx timed out\n",
++			    type == VBLK_T_IN ? "read" : "write", count, lba);
++			return ETIMEDOUT;
++		}
++		delay(1);
++	}
++	__builtin_arm_dsb(0xf);
++	vio_wr(VIO_INT_ACK, vio_rd(VIO_INT_STATUS));
++	if (*status != 0) {
++		printf("SWEET VBLK: %s of %u blocks at 0x%llx failed: status %u\n",
++		    type == VBLK_T_IN ? "read" : "write", count, lba, *status);
++		return EIO;
++	}
++	return 0;
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+ ufs_read_blocks(uint64_t lba, uint32_t count)
+ {
++	if (su.virtio) {
++		return vblk_io(VBLK_T_IN, lba, count);
++	}
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
+@@ -284,6 +491,9 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	if (su.virtio) {
++		return vblk_io(VBLK_T_OUT, lba, count);
++	}
+ 	uint8_t cdb[10] = {
+ 		0x2a, 0,
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+@@ -295,6 +505,9 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ static int
+ ufs_sync_cache(void)
+ {
++	if (su.virtio) {
++		return 0;                       /* no FLUSH negotiated: QEMU writes through */
++	}
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+@@ -592,9 +805,12 @@ sweet_ufs_init(void)
+ 	char want[64] = "userdata";
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	uint32_t vio = 0;
++	PE_parse_boot_argn("ufsvirtio", &vio, sizeof(vio));
++	su.virtio = (vio != 0);
++	if (!su.virtio && (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+-	    size < 2 * sizeof(uintptr_t)) {
++	    size < 2 * sizeof(uintptr_t))) {
+ 		printf("SWEET UFS: no /sweet-ufs node in the device tree\n");
+ 		return ENXIO;
+ 	}
+@@ -607,7 +823,9 @@ sweet_ufs_init(void)
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
+-	su.regs = ml_io_map(reg[0], reg[1]);
++	if (!su.virtio) {
++		su.regs = ml_io_map(reg[0], reg[1]);
++	}
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -622,14 +840,14 @@ sweet_ufs_init(void)
+ 	su.secsize = DEV_BSIZE;
+ 
+ 	lck_mtx_lock(&sweet_ufs_lock);
+-	error = ufs_take_over_host();
+-	if (!error) {
++	error = su.virtio ? vblk_init() : ufs_take_over_host();
++	if (!error && !su.virtio) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
+-	if (!error) {
++	if (!error && !su.virtio) {
+ 		error = ufs_find_partition(want);
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+@@ -654,6 +872,9 @@ sweet_ufs_init(void)
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
++	if (su.virtio) {
++		return 0;
++	}
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
