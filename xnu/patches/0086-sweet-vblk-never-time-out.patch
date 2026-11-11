@@ -1,0 +1,53 @@
+From: ios-sweet Windows/QEMU port
+Subject: [PATCH] sweet vblk: never abandon a request, track completions by count
+
+Patch 0085 gave up on a virtio-blk request after 5 s (the UFS timeout).
+Under QEMU on a busy Windows host a request can take longer; the abandoned
+request stayed queued and its late completion was taken for the next
+request: journal write errors, wrong data, crashing daemons. Wait for the
+used index to reach the submitted count, warning every 10 s.
+
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -432,21 +432,31 @@ vblk_io(uint32_t type, uint64_t lba, uint32_t count)
+ 	d[2].flags = VQ_F_WRITE;
+ 	d[2].next = 0;
+ 
+-	uint16_t seen = us->idx;
++	/*
++	 * Exactly one request is ever in flight (sweet_ufs_lock), so the device's
++	 * used index must reach the count we have submitted. Never give up on a
++	 * request: under QEMU on a busy Windows host one can take many seconds,
++	 * and abandoning it left it in the queue, where its late completion was
++	 * then taken for the NEXT request's (wrong data, journal errors, crashes).
++	 */
++	static uint16_t submitted;
++	submitted = (uint16_t)(submitted + 1);
+ 	av->ring[av->idx % VIO_QSIZE] = 0;
+ 	__builtin_arm_dsb(0xf);
+-	av->idx = (uint16_t)(av->idx + 1);
++	av->idx = submitted;
+ 	__builtin_arm_dsb(0xf);
+ 	vio_wr(VIO_QUEUE_NOTIFY, 0);
+ 
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(CMD_TIMEOUT_NS, &deadline);
+-	deadline += mach_absolute_time();
+-	while (us->idx == seen) {
+-		if (mach_absolute_time() > deadline) {
+-			printf("SWEET VBLK: %s of %u blocks at 0x%llx timed out\n",
+-			    type == VBLK_T_IN ? "read" : "write", count, lba);
+-			return ETIMEDOUT;
++	uint64_t interval, next_warn;
++	nanoseconds_to_absolutetime(10ull * NSEC_PER_SEC, &interval);
++	next_warn = mach_absolute_time() + interval;
++	unsigned waited = 0;
++	while (us->idx != submitted) {
++		if (mach_absolute_time() > next_warn) {
++			waited += 10;
++			printf("SWEET VBLK: %s of %u blocks at 0x%llx still pending after %u s\n",
++			    type == VBLK_T_IN ? "read" : "write", count, lba, waited);
++			next_warn += interval;
+ 		}
+ 		delay(1);
+ 	}
