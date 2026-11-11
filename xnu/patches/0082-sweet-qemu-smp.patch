@@ -57,14 +57,13 @@ one and pick the conduit with boot-arg sweethvc=1. No phone change.
  		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
  		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
  	}
-@@ -128,6 +145,11 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+@@ -128,6 +145,10 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	uint32_t requested = 1;
  	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
 +	PE_parse_boot_argn("sweethvc", &sweet_psci_hvc, sizeof(sweet_psci_hvc));
 +	if (sweet_psci_hvc) {
-+		IOLog("SWEET CPU: PSCI over HVC (sweethvc=1)
-+");
++		IOLog("SWEET CPU: PSCI over HVC (sweethvc=1)\n");
 +	}
  	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
  	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
