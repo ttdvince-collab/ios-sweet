@@ -1,0 +1,63 @@
+From: ios-sweet Windows/QEMU port
+Subject: [PATCH] memdev: 64-bit RAM disk size (md0 roots over 4 GB)
+
+mdSize is a 32-bit page count and every (mdSize << 12) was evaluated in 32
+bits: a 14.2 GB md0 (0x38C000 pages) wrapped to 0x8C000000 = 2.2 GB, so
+every read or write past 2.2 GB failed with EINVAL. On QEMU that made
+exec of /sbin/launchd fail with errno 22 and HFS fail to create its
+hotfile B-tree (EIO). Do the size arithmetic in 64 bits.
+
+--- a/bsd/dev/memdev.c
++++ b/bsd/dev/memdev.c
+@@ -247,10 +247,10 @@ mdevrw(dev_t dev, struct uio *uio, __unused int ioflag)
+ 		}
+ 	}
+ 
+-	if (uio->uio_offset > (mdev[devid].mdSize << 12)) {
++	if (uio->uio_offset > ((uint64_t)mdev[devid].mdSize << 12)) {
+ 		count = 0;
+ 	} else {
+-		count = imin(uio_resid(uio), (mdev[devid].mdSize << 12) - uio->uio_offset);
++		count = imin(uio_resid(uio), ((uint64_t)mdev[devid].mdSize << 12) - uio->uio_offset);
+ 	}
+ 
+ 	status = uiomove64(mdata, count, uio);     /* Move the data */
+@@ -285,16 +285,16 @@ mdevstrategy(struct buf *bp)
+  *	we just return with resid == count.
+  */
+ 
+-	if (blkoff >= (mdev[devid].mdSize << 12)) {                     /* Are they trying to read/write at/after end? */
+-		if (blkoff != (mdev[devid].mdSize << 12)) {              /* Are we trying to read after EOF? */
++	if (blkoff >= ((uint64_t)mdev[devid].mdSize << 12)) {                     /* Are they trying to read/write at/after end? */
++		if (blkoff != ((uint64_t)mdev[devid].mdSize << 12)) {              /* Are we trying to read after EOF? */
+ 			buf_seterror(bp, EINVAL);                                               /* Yeah, this is an error */
+ 		}
+ 		buf_biodone(bp);                                                                /* Return */
+ 		return;
+ 	}
+ 
+-	if ((blkoff + buf_count(bp)) > (mdev[devid].mdSize << 12)) {            /* Will this read go past end? */
+-		buf_setcount(bp, (uint32_t)((mdev[devid].mdSize << 12) - blkoff));  /* Yes, trim to max */
++	if ((blkoff + buf_count(bp)) > ((uint64_t)mdev[devid].mdSize << 12)) {            /* Will this read go past end? */
++		buf_setcount(bp, (uint32_t)(((uint64_t)mdev[devid].mdSize << 12) - blkoff));  /* Yes, trim to max */
+ 	}
+ 	/*
+ 	 * make sure the buffer's data area is
+@@ -439,7 +439,7 @@ mdevioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 		if (!(mdev[devid].mdFlags & mdInited)) {
+ 			return ENXIO;
+ 		}
+-		*o = ((mdev[devid].mdSize << 12) + mdev[devid].mdSecsize - 1) / mdev[devid].mdSecsize;
++		*o = (((uint64_t)mdev[devid].mdSize << 12) + mdev[devid].mdSecsize - 1) / mdev[devid].mdSecsize;
+ 		break;
+ 
+ 	/*
+@@ -765,7 +765,7 @@ mdevgetrange(int devid, uint64_t *base, uint64_t *size)
+ 	}
+ 
+ 	*base = mdev[devid].mdBase << 12;
+-	*size = mdev[devid].mdSize << 12;
++	*size = (uint64_t)mdev[devid].mdSize << 12;
+ 
+ 	/* make sure (base, size) is a valid range and will not overflow */
+ 	assert(*size < (UINT64_MAX - *base));
