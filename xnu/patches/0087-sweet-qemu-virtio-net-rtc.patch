@@ -9,7 +9,9 @@ polled from a kernel thread every 2 ms, 64 x 2 KiB RX/TX buffers, no
 offloads) as the kernel ethernet interface en1, with the same ifnet glue
 as the phone's USB ECM ue0. It sets 10.0.2.15/24 and a default route to
 10.0.2.2 for QEMU's user-mode network (QEMU's DNS proxy is 10.0.2.3).
-Started from sweet_ufs_init in ufsvirtio mode.
+Started from sweet_ufs_init in ufsvirtio mode. configd deletes the default
+route (it does not know en1, a non-IOKit interface) about 45 s into boot:
+the polling thread adds it back every 5 s.
 
 With sweetrtc=1, IOKitInitializeTime sets the calendar from the QEMU virt
 PL031 RTC (0x09010000, data register = host UTC seconds).
@@ -46,7 +48,7 @@ Without the boot-args nothing changes.
  	sweet_log_start();
 --- /dev/null
 +++ b/bsd/dev/sweet_vnet.c
-@@ -0,0 +1,486 @@
+@@ -0,0 +1,506 @@
 +/*
 + * SWEET on QEMU: network over a QEMU virt virtio-mmio network device
 + * (virtio 1.x MMIO, QEMU's -global virtio-mmio.force-legacy=false), enabled
@@ -158,6 +160,7 @@ Without the boot-args nothing changes.
 +	uint16_t    tx_seen;
 +	uint64_t    rx_frames, tx_frames, tx_drops;
 +	int         sleep_chan;
++	uint32_t    gw;
 +} vn;
 +
 +static inline uint32_t
@@ -413,6 +416,22 @@ Without the boot-args nothing changes.
 +	a->sin_addr.s_addr = htonl(addr);
 +}
 +
++/*
++ * Default route to the gateway. configd does not know en1 (it lists only
++ * IOKit network interfaces) and deletes this route about 45 s into boot as
++ * one it does not own: vn_thread adds it back (EEXIST while it is there).
++ */
++static int
++vn_route_add(void)
++{
++	struct sockaddr_in dst, mask, gate;
++	vn_sin(&dst, 0);
++	vn_sin(&mask, 0);
++	vn_sin(&gate, vn.gw);
++	return rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gate,
++	           (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++}
++
 +static int
 +vn_if_create(uint32_t ip, uint32_t gw)
 +{
@@ -471,13 +490,9 @@ Without the boot-args nothing changes.
 +		sock_close(so);
 +	}
 +	int rerr = -1;
++	vn.gw = gw;
 +	if (err == 0) {
-+		struct sockaddr_in dst, mask, gate;
-+		vn_sin(&dst, 0);
-+		vn_sin(&mask, 0);
-+		vn_sin(&gate, gw);
-+		rerr = rtrequest(RTM_ADD, (struct sockaddr *)&dst, (struct sockaddr *)&gate,
-+		    (struct sockaddr *)&mask, RTF_UP | RTF_GATEWAY | RTF_STATIC, NULL);
++		rerr = vn_route_add();
 +	}
 +	printf("SWEET VNET: en1 %02x:%02x:%02x:%02x:%02x:%02x %u.%u.%u.%u/24 gw %u.%u.%u.%u (addr err %d, route err %d)\n",
 +	    vn.mac[0], vn.mac[1], vn.mac[2], vn.mac[3], vn.mac[4], vn.mac[5],
@@ -498,11 +513,18 @@ Without the boot-args nothing changes.
 +static void
 +vn_thread(void *arg __unused, wait_result_t wr __unused)
 +{
-+	uint64_t next_report = 0, period;
++	uint64_t next_report = 0, period, next_route = 0, route_period;
 +	nanoseconds_to_absolutetime(60ULL * NSEC_PER_SEC, &period);
++	nanoseconds_to_absolutetime(5ULL * NSEC_PER_SEC, &route_period);
 +	for (;;) {
 +		vn_rx_poll();
 +		vn_wr(VIO_INT_ACK, vn_rd(VIO_INT_STATUS));
++		if (mach_absolute_time() > next_route) {
++			if (next_route && vn_route_add() == 0) {
++				printf("SWEET VNET: default route restored\n");
++			}
++			next_route = mach_absolute_time() + route_period;
++		}
 +		if (mach_absolute_time() > next_report) {
 +			if (next_report) {
 +				printf("SWEET VNET: rx %llu tx %llu frames, %llu tx drops\n",
@@ -568,7 +590,7 @@ Without the boot-args nothing changes.
  void
  IOKitInitializeTime( void )
  {
-@@ -89,6 +116,9 @@
+@@ -89,6 +115,9 @@
  #endif
  
  	clock_initialize_calendar();
